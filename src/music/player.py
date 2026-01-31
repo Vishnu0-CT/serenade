@@ -10,6 +10,7 @@ import discord
 from src.clients.youtube import YouTubeClient
 from src.models.track import Track
 from src.music.queue import GuildQueue
+from src.ui.embeds import now_playing_embed
 
 
 IDLE_TIMEOUT_SECONDS = 120  # 2 minutes
@@ -164,18 +165,25 @@ class Player:
         voice_client: discord.VoiceClient,
         queue: GuildQueue,
         youtube: YouTubeClient,
+        text_channel: discord.abc.Messageable | None = None,
         on_track_start: Callable[[Track], None] | None = None,
         on_disconnect: Callable[[], None] | None = None,
     ):
         self.voice_client = voice_client
         self.queue = queue
         self.youtube = youtube
+        self.text_channel = text_channel
         self.on_track_start = on_track_start
         self.on_disconnect = on_disconnect
         self._idle_task: asyncio.Task | None = None
 
-    async def play_next(self) -> Track | None:
-        """Play the next track in the queue. Returns the track or None if queue empty."""
+    async def play_next(self, *, notify: bool = True) -> Track | None:
+        """Play the next track in the queue. Returns the track or None if queue empty.
+
+        Args:
+            notify: If True, sends a "Now Playing" message to the text channel.
+                    Set to False when the caller handles its own response.
+        """
         self._cancel_idle_timer()
 
         track = self.queue.next()
@@ -189,7 +197,7 @@ class Player:
         def after_callback(error: Exception | None):
             if error:
                 print(f"Player error: {error}")
-            # Schedule play_next on the event loop
+            # Schedule play_next on the event loop (always notify on auto-advance)
             asyncio.run_coroutine_threadsafe(
                 self.play_next(), self.voice_client.loop
             )
@@ -198,6 +206,10 @@ class Player:
 
         if self.on_track_start:
             self.on_track_start(track)
+
+        # Send "Now Playing" notification if enabled
+        if notify and self.text_channel:
+            await self.text_channel.send(embed=now_playing_embed(track))
 
         return track
 
@@ -265,6 +277,7 @@ class PlayerManager:
         guild_id: int,
         voice_client: discord.VoiceClient,
         queue: GuildQueue,
+        text_channel: discord.abc.Messageable | None = None,
         on_track_start: Callable[[Track], None] | None = None,
         on_disconnect: Callable[[], None] | None = None,
     ) -> Player:
@@ -273,6 +286,7 @@ class PlayerManager:
             voice_client=voice_client,
             queue=queue,
             youtube=self._youtube,
+            text_channel=text_channel,
             on_track_start=on_track_start,
             on_disconnect=on_disconnect,
         )

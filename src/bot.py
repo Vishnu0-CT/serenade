@@ -64,7 +64,14 @@ class MusicBot(discord.Client):
         self.players = PlayerManager(self.youtube)
 
     async def setup_hook(self):
-        await self.tree.sync()
+        # Guild-specific sync is instant; global sync can take up to an hour
+        test_guild_id = os.getenv("TEST_GUILD_ID")
+        if test_guild_id:
+            guild = discord.Object(id=int(test_guild_id))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        else:
+            await self.tree.sync()
 
 
 bot = MusicBot()
@@ -161,6 +168,7 @@ async def play(interaction: discord.Interaction, query: str):
                 guild_id=guild_id,
                 voice_client=voice_client,
                 queue=queue,
+                text_channel=interaction.channel,
                 on_disconnect=on_disconnect,
             )
         return player
@@ -224,7 +232,7 @@ async def play(interaction: discord.Interaction, query: str):
 
     # Start playing if not already
     if not player.is_playing():
-        played_track = await player.play_next()
+        played_track = await player.play_next(notify=False)
         if played_track:
             await interaction.followup.send(embed=now_playing_embed(played_track))
         else:
@@ -318,6 +326,15 @@ async def clear(interaction: discord.Interaction):
     queue = bot.queues.get(interaction.guild_id)
     queue.clear()
     await interaction.response.send_message("Queue cleared.")
+
+
+@bot.tree.command(name="shuffle", description="Toggle shuffle mode")
+@app_commands.describe(enabled="Turn shuffle on or off")
+async def shuffle(interaction: discord.Interaction, enabled: bool):
+    queue = bot.queues.get(interaction.guild_id)
+    queue.shuffle = enabled
+    status = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(f"Shuffle {status}.")
 
 
 @bot.event

@@ -1,3 +1,4 @@
+import random
 from collections import deque
 
 from src.models.track import Track
@@ -9,6 +10,7 @@ class GuildQueue:
     def __init__(self):
         self._queue: deque[Track] = deque()
         self.current: Track | None = None
+        self.shuffle: bool = False
 
     def add(self, track: Track) -> int:
         """Add a track to the queue. Returns position in queue (0 = playing next)."""
@@ -20,8 +22,33 @@ class GuildQueue:
         if not self._queue:
             self.current = None
             return None
-        self.current = self._queue.popleft()
+
+        if self.shuffle:
+            self.current = self._pick_shuffle_track()
+        else:
+            self.current = self._queue.popleft()
+
         return self.current
+
+    def _pick_shuffle_track(self) -> Track:
+        """Pick next track using fair shuffle: alternate requesters when possible."""
+        prev_requester = self.current.requested_by if self.current else None
+
+        # Find tracks from other requesters
+        other_indices = [
+            i for i, t in enumerate(self._queue)
+            if t.requested_by != prev_requester
+        ]
+
+        if other_indices:
+            idx = random.choice(other_indices)
+        else:
+            # All tracks are from the same requester, pick randomly
+            idx = random.randrange(len(self._queue))
+
+        track = self._queue[idx]
+        del self._queue[idx]
+        return track
 
     def skip(self) -> Track | None:
         """Skip current track and return the next one."""
