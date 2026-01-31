@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import discord
@@ -32,6 +33,7 @@ from src.ui.embeds import (
     added_to_queue_embed,
     error_embed,
     now_playing_embed,
+    playlist_added_embed,
     queue_embed,
 )
 
@@ -88,6 +90,52 @@ async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient 
     return voice_client
 
 
+async def _stream_playlist_to_queue(
+    resolver: Resolver,
+    playlist_type: str,  # "spotify" or "youtube"
+    url: str,
+    queue,
+    player,
+    requested_by: str,
+    interaction: discord.Interaction,
+):
+    """Background task: resolve playlist tracks and add to queue as they resolve."""
+    iterator = (
+        resolver.iter_spotify_playlist(url)
+        if playlist_type == "spotify"
+        else resolver.iter_youtube_playlist(url)
+    )
+
+    tracks_added = []
+    first_track = True
+
+    # Wrap blocking next() call to run in thread pool
+    def get_next_track():
+        try:
+            return next(iterator)
+        except StopIteration:
+            return None
+
+    while True:
+        # Run blocking I/O in thread so event loop stays responsive
+        track = await asyncio.to_thread(get_next_track)
+        if track is None:
+            break
+
+        track.requested_by = requested_by
+        queue.add(track)
+        tracks_added.append(track)
+
+        # Start playing on first track
+        if first_track and not player.is_playing():
+            await player.play_next()
+            first_track = False
+
+    # Send summary when done
+    if tracks_added:
+        await interaction.followup.send(embed=playlist_added_embed(tracks_added, 0))
+
+
 @bot.tree.command(name="play", description="Play a song from a search query or URL")
 @app_commands.describe(query="Song name, Spotify URL, or YouTube URL")
 async def play(interaction: discord.Interaction, query: str):
@@ -99,6 +147,56 @@ async def play(interaction: discord.Interaction, query: str):
 
     guild_id = interaction.guild_id
     queue = bot.queues.get(guild_id)
+
+    # Helper to ensure player exists
+    def get_or_create_player():
+        player = bot.players.get(guild_id)
+        if not player:
+
+            def on_disconnect():
+                bot.players.remove(guild_id)
+                bot.queues.remove(guild_id)
+
+            player = bot.players.create(
+                guild_id=guild_id,
+                voice_client=voice_client,
+                queue=queue,
+                on_disconnect=on_disconnect,
+            )
+        return player
+
+    # Detect playlist URLs and stream them
+    if "open.spotify.com/playlist" in query or "spotify:playlist:" in query:
+        player = get_or_create_player()
+        await interaction.followup.send("Loading Spotify playlist...")
+        asyncio.create_task(
+            _stream_playlist_to_queue(
+                bot.resolver,
+                "spotify",
+                query,
+                queue,
+                player,
+                interaction.user.display_name,
+                interaction,
+            )
+        )
+        return
+
+    if "youtube.com/playlist" in query:
+        player = get_or_create_player()
+        await interaction.followup.send("Loading YouTube playlist...")
+        asyncio.create_task(
+            _stream_playlist_to_queue(
+                bot.resolver,
+                "youtube",
+                query,
+                queue,
+                player,
+                interaction.user.display_name,
+                interaction,
+            )
+        )
+        return
 
     # Resolve the query to track(s)
     try:
@@ -122,19 +220,7 @@ async def play(interaction: discord.Interaction, query: str):
             first_position = position
 
     # Get or create player
-    player = bot.players.get(guild_id)
-    if not player:
-
-        def on_disconnect():
-            bot.players.remove(guild_id)
-            bot.queues.remove(guild_id)
-
-        player = bot.players.create(
-            guild_id=guild_id,
-            voice_client=voice_client,
-            queue=queue,
-            on_disconnect=on_disconnect,
-        )
+    player = get_or_create_player()
 
     # Start playing if not already
     if not player.is_playing():

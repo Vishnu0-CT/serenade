@@ -128,3 +128,28 @@ class YouTubeClient:
             )
         except yt_dlp.DownloadError:
             return None
+
+    def get_playlist_entries(self, url: str) -> list[dict]:
+        """Get video entries from YouTube playlist using flat extraction."""
+        opts = {
+            "extract_flat": "in_playlist",
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ytdl:
+            try:
+                result = ytdl.extract_info(url, download=False)
+            except Exception:
+                return []
+
+        entries = result.get("entries", []) if result else []
+        return [
+            {
+                "id": e.get("id"),
+                "title": e.get("title", "Unknown"),
+                "duration": e.get("duration", 0),
+            }
+            for e in entries
+            if e and e.get("id")
+        ]

@@ -95,3 +95,29 @@ def error_embed(message: str) -> discord.Embed:
         description=message,
         color=discord.Color.red(),
     )
+
+
+def playlist_added_embed(tracks: list[Track], failed_count: int = 0) -> discord.Embed:
+    """Embed for playlist added to queue."""
+    desc = f"**{len(tracks)} tracks** added to queue"
+    if failed_count > 0:
+        desc += f" ({failed_count} could not be resolved)"
+
+    embed = discord.Embed(
+        title="Playlist Loaded",
+        description=desc,
+        color=discord.Color.blue(),
+    )
+
+    # Total duration
+    total_ms = sum(t.duration_ms for t in tracks)
+    minutes = total_ms // 60000
+    embed.add_field(name="Duration", value=f"{minutes}m", inline=True)
+
+    # Preview first 5 tracks
+    preview = "\n".join(f"`{i+1}.` {t.title}" for i, t in enumerate(tracks[:5]))
+    if len(tracks) > 5:
+        preview += f"\n*...and {len(tracks) - 5} more*"
+    embed.add_field(name="Tracks", value=preview, inline=False)
+
+    return embed

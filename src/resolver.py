@@ -1,7 +1,11 @@
+from typing import Iterator
+
 from src.clients.spotify_scraper import SpotifyScraperClient
 from src.clients.youtube import YouTubeClient
 from src.clients.ytmusic import YTMusicClient
 from src.models.track import Track
+
+MAX_PLAYLIST_TRACKS = 500
 
 
 class Resolver:
@@ -144,9 +148,61 @@ class Resolver:
         )
 
     def _resolve_youtube_playlist(self, url: str) -> list[Track]:
-        """YouTube playlist support - not yet implemented."""
-        raise NotImplementedError("YouTube playlists not yet supported")
+        """Resolve YouTube playlist to list of tracks."""
+        return list(self.iter_youtube_playlist(url))
 
     def _resolve_spotify_playlist(self, url: str) -> list[Track]:
-        """Spotify playlist support - not yet implemented."""
-        raise NotImplementedError("Spotify playlists not yet supported")
+        """Resolve Spotify playlist to list of tracks."""
+        return list(self.iter_spotify_playlist(url))
+
+    def iter_spotify_playlist(self, url: str) -> Iterator[Track]:
+        """Yield tracks from Spotify playlist one at a time."""
+        playlist_tracks = self.spotify.get_playlist_tracks(url)
+        if not playlist_tracks:
+            raise ValueError(f"Could not load Spotify playlist: {url}")
+
+        for track_info in playlist_tracks[:MAX_PLAYLIST_TRACKS]:
+            try:
+                yield self._spotify_track_info_to_track(track_info, url)
+            except ValueError:
+                continue  # Skip tracks that can't be resolved
+
+    def iter_youtube_playlist(self, url: str) -> Iterator[Track]:
+        """Yield tracks from YouTube playlist one at a time."""
+        entries = self.youtube.get_playlist_entries(url)
+        if not entries:
+            raise ValueError(f"Could not load YouTube playlist: {url}")
+
+        for entry in entries[:MAX_PLAYLIST_TRACKS]:
+            video_id = entry.get("id")
+            if not video_id:
+                continue
+            yield Track(
+                title=entry.get("title", "Unknown"),
+                artist="YouTube",
+                duration_ms=(entry.get("duration") or 0) * 1000,
+                album_art_url=None,
+                youtube_url=f"https://www.youtube.com/watch?v={video_id}",
+                source_url=url,
+            )
+
+    def _spotify_track_info_to_track(self, track_info: dict, source_url: str) -> Track:
+        """Convert Spotify track dict to Track by searching YTMusic."""
+        title = track_info.get("name", "")
+        artists = track_info.get("artists", [])
+        artist = artists[0]["name"] if artists else ""
+        duration_ms = track_info.get("duration_ms", 0)
+
+        result = self.ytmusic.search_track(f"{title} {artist}")
+        if not result:
+            raise ValueError(f"Could not find: {title}")
+
+        metadata, video_id = result
+        return Track(
+            title=title,
+            artist=artist,
+            duration_ms=duration_ms,
+            album_art_url=metadata.album_art_url,
+            youtube_url=f"https://www.youtube.com/watch?v={video_id}",
+            source_url=source_url,
+        )

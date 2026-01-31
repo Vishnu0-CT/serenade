@@ -1,6 +1,8 @@
 import asyncio
+import queue
 import shutil
 import subprocess
+import threading
 from typing import Callable
 
 import discord
@@ -12,17 +14,53 @@ from src.music.queue import GuildQueue
 
 IDLE_TIMEOUT_SECONDS = 120  # 2 minutes
 
+# Audio constants
+FRAME_SIZE = 3840  # 20ms of 48kHz stereo 16-bit audio (48000 * 2 * 2 * 0.02)
+FRAMES_PER_SECOND = 50
+
+# Buffer configuration
+AUDIO_BUFFER_SECONDS = 5.0  # Max buffer size
+AUDIO_PREBUFFER_SECONDS = 2.0  # Wait for this much audio before starting playback
+
 
 class YTDLPAudioSource(discord.AudioSource):
-    """Audio source that streams from YouTube via yt-dlp pipe."""
+    """Audio source that streams from YouTube via yt-dlp with buffering.
 
-    def __init__(self, youtube_url: str):
+    Uses a background thread to continuously read from ffmpeg into a thread-safe
+    buffer, isolating Discord's read() calls from network jitter.
+    """
+
+    def __init__(
+        self,
+        youtube_url: str,
+        buffer_seconds: float = AUDIO_BUFFER_SECONDS,
+        prebuffer_seconds: float = AUDIO_PREBUFFER_SECONDS,
+    ):
         self.youtube_url = youtube_url
         self._process: subprocess.Popen | None = None
         self._ffmpeg: subprocess.Popen | None = None
-        self._spawned = False
 
-    def _spawn(self):
+        # Buffer configuration
+        self._buffer_frames = int(buffer_seconds * FRAMES_PER_SECOND)
+        self._prebuffer_frames = int(prebuffer_seconds * FRAMES_PER_SECOND)
+
+        # Thread-safe buffer
+        self._buffer: queue.Queue[bytes] = queue.Queue(maxsize=self._buffer_frames)
+        self._buffer_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._prebuffer_ready = threading.Event()
+        self._eof = False
+
+        # Start buffering immediately
+        self._start_buffering()
+
+    def _start_buffering(self):
+        """Start the background buffering thread."""
+        self._spawn_processes()
+        self._buffer_thread = threading.Thread(target=self._buffer_loop, daemon=True)
+        self._buffer_thread.start()
+
+    def _spawn_processes(self):
         """Spawn yt-dlp and ffmpeg processes."""
         ytdlp_path = shutil.which("yt-dlp") or "yt-dlp"
         ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
@@ -61,21 +99,55 @@ class YTDLPAudioSource(discord.AudioSource):
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
-        self._spawned = True
+
+    def _buffer_loop(self):
+        """Background thread: continuously read from ffmpeg into buffer."""
+        frames_buffered = 0
+
+        while not self._stop_event.is_set():
+            data = self._ffmpeg.stdout.read(FRAME_SIZE)
+
+            if len(data) < FRAME_SIZE:
+                # End of stream or error
+                self._eof = True
+                self._prebuffer_ready.set()  # Unblock read() if waiting
+                break
+
+            try:
+                # Put frame in buffer (blocks if buffer is full, with timeout)
+                self._buffer.put(data, timeout=1.0)
+                frames_buffered += 1
+
+                # Signal when prebuffer is ready
+                if frames_buffered == self._prebuffer_frames:
+                    self._prebuffer_ready.set()
+
+            except queue.Full:
+                # Buffer full - this means consumer is slower than producer
+                # In practice, shouldn't happen with proper buffer sizing
+                pass
 
     def read(self) -> bytes:
-        """Read 20ms of audio."""
-        if not self._spawned:
-            self._spawn()
+        """Read 20ms of audio from buffer."""
+        # Wait for prebuffer on first read
+        if not self._prebuffer_ready.is_set():
+            self._prebuffer_ready.wait(timeout=10.0)
 
-        # Discord expects 20ms of 48kHz stereo 16-bit audio = 3840 bytes
-        data = self._ffmpeg.stdout.read(3840)
-        if len(data) < 3840:
-            return b""
-        return data
+        try:
+            return self._buffer.get(timeout=0.5)
+        except queue.Empty:
+            if self._eof:
+                return b""  # Signal end of stream
+            # Buffer underrun - return silence rather than speed up
+            return b"\x00" * FRAME_SIZE
 
     def cleanup(self):
-        """Clean up processes."""
+        """Clean up processes and threads."""
+        self._stop_event.set()
+
+        if self._buffer_thread and self._buffer_thread.is_alive():
+            self._buffer_thread.join(timeout=2.0)
+
         if self._ffmpeg:
             self._ffmpeg.kill()
             self._ffmpeg = None
