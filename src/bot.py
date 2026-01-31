@@ -1,0 +1,251 @@
+import os
+
+import discord
+from discord import app_commands
+from dotenv import load_dotenv
+
+# Load opus for voice support
+if not discord.opus.is_loaded():
+    OPUS_PATHS = [
+        "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
+        "/usr/local/lib/libopus.dylib",      # Intel Mac
+    ]
+    for path in OPUS_PATHS:
+        if os.path.exists(path):
+            try:
+                discord.opus.load_opus(path)
+                print(f"Loaded opus from {path}")
+                break
+            except Exception as e:
+                print(f"Failed to load opus from {path}: {e}")
+
+    if not discord.opus.is_loaded():
+        print("WARNING: Opus not loaded - voice will not work!")
+
+from src.clients.spotify_scraper import SpotifyScraperClient
+from src.clients.youtube import YouTubeClient
+from src.clients.ytmusic import YTMusicClient
+from src.music.player import PlayerManager
+from src.music.queue import QueueManager
+from src.resolver import Resolver
+from src.ui.embeds import (
+    added_to_queue_embed,
+    error_embed,
+    now_playing_embed,
+    queue_embed,
+)
+
+load_dotenv()
+
+
+class MusicBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.voice_states = True
+        super().__init__(intents=intents)
+
+        self.tree = app_commands.CommandTree(self)
+
+        # Initialize clients
+        self.ytmusic = YTMusicClient()
+        self.youtube = YouTubeClient()
+        self.spotify = SpotifyScraperClient()
+
+        # Create resolver with all clients
+        self.resolver = Resolver(
+            ytmusic=self.ytmusic,
+            youtube=self.youtube,
+            spotify=self.spotify,
+        )
+
+        self.queues = QueueManager()
+        self.players = PlayerManager(self.youtube)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+
+
+bot = MusicBot()
+
+
+async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
+    """Ensure the bot is in the user's voice channel. Returns VoiceClient or None."""
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message(
+            embed=error_embed("You must be in a voice channel."),
+            ephemeral=True,
+        )
+        return None
+
+    user_channel = interaction.user.voice.channel
+    voice_client = interaction.guild.voice_client
+
+    if voice_client is None:
+        voice_client = await user_channel.connect()
+    elif voice_client.channel != user_channel:
+        await voice_client.move_to(user_channel)
+
+    return voice_client
+
+
+@bot.tree.command(name="play", description="Play a song from a search query or URL")
+@app_commands.describe(query="Song name, Spotify URL, or YouTube URL")
+async def play(interaction: discord.Interaction, query: str):
+    voice_client = await ensure_voice(interaction)
+    if not voice_client:
+        return
+
+    await interaction.response.defer()
+
+    guild_id = interaction.guild_id
+    queue = bot.queues.get(guild_id)
+
+    # Resolve the query to track(s)
+    try:
+        tracks = bot.resolver.resolve(query)
+    except NotImplementedError as e:
+        await interaction.followup.send(embed=error_embed(str(e)))
+        return
+    except ValueError as e:
+        await interaction.followup.send(embed=error_embed(str(e)))
+        return
+    except Exception:
+        await interaction.followup.send(embed=error_embed("Could not find that song."))
+        return
+
+    # Set requested_by for all tracks and add to queue
+    first_position = None
+    for track in tracks:
+        track.requested_by = interaction.user.display_name
+        position = queue.add(track)
+        if first_position is None:
+            first_position = position
+
+    # Get or create player
+    player = bot.players.get(guild_id)
+    if not player:
+
+        def on_disconnect():
+            bot.players.remove(guild_id)
+            bot.queues.remove(guild_id)
+
+        player = bot.players.create(
+            guild_id=guild_id,
+            voice_client=voice_client,
+            queue=queue,
+            on_disconnect=on_disconnect,
+        )
+
+    # Start playing if not already
+    if not player.is_playing():
+        played_track = await player.play_next()
+        if played_track:
+            await interaction.followup.send(embed=now_playing_embed(played_track))
+        else:
+            await interaction.followup.send(embed=error_embed("Failed to play track."))
+    else:
+        # Show the first track added (for single tracks or first of playlist)
+        await interaction.followup.send(embed=added_to_queue_embed(tracks[0], first_position))
+
+
+@bot.tree.command(name="skip", description="Skip the current song")
+async def skip(interaction: discord.Interaction):
+    player = bot.players.get(interaction.guild_id)
+    if not player or not player.is_playing():
+        await interaction.response.send_message(
+            embed=error_embed("Nothing is playing."),
+            ephemeral=True,
+        )
+        return
+
+    current = bot.queues.get(interaction.guild_id).current
+    player.skip()
+    await interaction.response.send_message(
+        f"Skipped **{current.title}** by {current.artist}" if current else "Skipped."
+    )
+
+
+@bot.tree.command(name="stop", description="Stop playback and clear the queue")
+async def stop(interaction: discord.Interaction):
+    player = bot.players.get(interaction.guild_id)
+    if not player:
+        await interaction.response.send_message(
+            embed=error_embed("Nothing is playing."),
+            ephemeral=True,
+        )
+        return
+
+    await player.stop()
+    bot.players.remove(interaction.guild_id)
+    bot.queues.remove(interaction.guild_id)
+    await interaction.response.send_message("Stopped playback and cleared the queue.")
+
+
+@bot.tree.command(name="pause", description="Pause playback")
+async def pause(interaction: discord.Interaction):
+    player = bot.players.get(interaction.guild_id)
+    if not player:
+        await interaction.response.send_message(
+            embed=error_embed("Nothing is playing."),
+            ephemeral=True,
+        )
+        return
+
+    if player.pause():
+        await interaction.response.send_message("Paused.")
+    else:
+        await interaction.response.send_message(
+            embed=error_embed("Nothing is playing."),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="resume", description="Resume playback")
+async def resume(interaction: discord.Interaction):
+    player = bot.players.get(interaction.guild_id)
+    if not player:
+        await interaction.response.send_message(
+            embed=error_embed("Nothing to resume."),
+            ephemeral=True,
+        )
+        return
+
+    if player.resume():
+        await interaction.response.send_message("Resumed.")
+    else:
+        await interaction.response.send_message(
+            embed=error_embed("Nothing is paused."),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="queue", description="Show the current queue")
+async def show_queue(interaction: discord.Interaction):
+    queue = bot.queues.get(interaction.guild_id)
+    tracks = queue.get_list()
+    current = queue.current
+    await interaction.response.send_message(embed=queue_embed(tracks, current))
+
+
+@bot.tree.command(name="clear", description="Clear the queue (keeps current song playing)")
+async def clear(interaction: discord.Interaction):
+    queue = bot.queues.get(interaction.guild_id)
+    queue.clear()
+    await interaction.response.send_message("Queue cleared.")
+
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print("------")
+
+
+def main():
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise ValueError("DISCORD_TOKEN environment variable is not set")
+    bot.run(token)
+
+
+if __name__ == "__main__":
+    main()
